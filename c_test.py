@@ -24,7 +24,7 @@ from sklearn.metrics import (
 
 # =============================================================================
 # Retrieves env var 'NUM_TEST_SAMPLES', defaults to 10 if not set
-NUM_TEST_SAMPLES = int(os.getenv("NUM_TEST_SAMPLES", 10))
+NUM_TEST_SAMPLES = int(os.getenv("NUM_TEST_SAMPLES", 10000))
 
 class SimpleCNN(nn.Module):
     def __init__(self):
