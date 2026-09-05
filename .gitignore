@@ -1,0 +1,3 @@
+*.json
+classical_data/**/*
+test_results/codecarbon/*
