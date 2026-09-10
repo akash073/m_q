@@ -1,3 +1,8 @@
 *.json
 classical_data/**/*
 test_results/codecarbon/*
+mnisq_kuzushiji_data
+mnisq_kuzushiji_results_q1
+test_results/9f56743a/*
+internet_access.ipynb
+dnn_cnn_dataset_33673b86_kmnist_vanilla.csv
