@@ -6,3 +6,7 @@ mnisq_kuzushiji_results_q1
 test_results/9f56743a/*
 internet_access.ipynb
 dnn_cnn_dataset_33673b86_kmnist_vanilla.csv
+mnisq_fashionmnist_data/**/*
+mnisq_mnist_data/**/*
+quantum_test_results/**/*
+test_results/9f56743a/*
