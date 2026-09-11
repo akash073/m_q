@@ -1115,7 +1115,7 @@ Install once:
 pip install requests tqdm
 """
 
-from __future__ import annotations
+
 
 import os
 import zipfile
