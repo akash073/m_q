@@ -1095,5 +1095,368 @@ def main():
     print("\nDone.")
 
 
+
+"""
+MNISQ Datasets: Combined Download & Extract
+================================================================================
+
+Downloads and extracts all three MNISQ base-QASM archives (MNIST,
+Fashion-MNIST, Kuzushiji-MNIST) in one run, each into its own directory,
+skipping anything already present. Function names are dataset-specific
+(ensure_mnist_dataset_available, ensure_fashionmnist_dataset_available,
+ensure_kuzushiji_dataset_available) so it's always clear which dataset a
+given call is fetching, even though they all share the same generic
+download/extract machinery underneath.
+
+Run this once before the three training scripts, or run it standalone
+just to pre-fetch/verify all three datasets.
+
+Install once:
+pip install requests tqdm
+"""
+
+from __future__ import annotations
+
+import os
+import zipfile
+from pathlib import Path
+
+import requests
+from tqdm.auto import tqdm
+
+# =============================================================================
+# SHARED CONFIGURATION
+# =============================================================================
+
+FIDELITY = "f90"  # "f80", "f90", or "f95" -- must match what the training scripts expect
+
+PROJECT_ROOT = Path.cwd()
+
+OFFICIAL_BASE_URL = (
+    "https://qulacs-quantum-datasets.s3.us-west-1.amazonaws.com"
+)
+
+# Per-dataset folders and archive names, matching each training script's
+# own DATA_ROOT / DOWNLOAD_ROOT / EXTRACT_ROOT layout exactly, so the
+# training scripts find the data without any path changes.
+MNIST_DATA_ROOT = PROJECT_ROOT / "mnisq_mnist_data"
+MNIST_DOWNLOAD_ROOT = MNIST_DATA_ROOT / "downloads"
+MNIST_EXTRACT_ROOT = MNIST_DATA_ROOT / "extracted"
+MNIST_TRAIN_ARCHIVE_NAME = f"base_train_orig_mnist_784_{FIDELITY}.zip"
+MNIST_TEST_ARCHIVE_NAME = f"base_test_mnist_784_{FIDELITY}.zip"
+
+FASHIONMNIST_DATA_ROOT = PROJECT_ROOT / "mnisq_fashionmnist_data"
+FASHIONMNIST_DOWNLOAD_ROOT = FASHIONMNIST_DATA_ROOT / "downloads"
+FASHIONMNIST_EXTRACT_ROOT = FASHIONMNIST_DATA_ROOT / "extracted"
+FASHIONMNIST_TRAIN_ARCHIVE_NAME = f"base_train_orig_Fashion-MNIST_{FIDELITY}.zip"
+FASHIONMNIST_TEST_ARCHIVE_NAME = f"base_test_Fashion-MNIST_{FIDELITY}.zip"
+
+KUZUSHIJI_DATA_ROOT = PROJECT_ROOT / "mnisq_kuzushiji_data"
+KUZUSHIJI_DOWNLOAD_ROOT = KUZUSHIJI_DATA_ROOT / "downloads"
+KUZUSHIJI_EXTRACT_ROOT = KUZUSHIJI_DATA_ROOT / "extracted"
+KUZUSHIJI_TRAIN_ARCHIVE_NAME = f"base_train_orig_Kuzushiji-MNIST_{FIDELITY}.zip"
+KUZUSHIJI_TEST_ARCHIVE_NAME = f"base_test_Kuzushiji-MNIST_{FIDELITY}.zip"
+
+for folder in [
+    MNIST_DATA_ROOT, MNIST_DOWNLOAD_ROOT, MNIST_EXTRACT_ROOT,
+    FASHIONMNIST_DATA_ROOT, FASHIONMNIST_DOWNLOAD_ROOT, FASHIONMNIST_EXTRACT_ROOT,
+    KUZUSHIJI_DATA_ROOT, KUZUSHIJI_DOWNLOAD_ROOT, KUZUSHIJI_EXTRACT_ROOT,
+]:
+    folder.mkdir(parents=True, exist_ok=True)
+
+
+# =============================================================================
+# GENERIC DOWNLOAD / EXTRACT HELPERS (shared by all three datasets)
+# =============================================================================
+
+def human_size(number_of_bytes: int | float) -> str:
+    value = float(number_of_bytes)
+    units = ["B", "KB", "MB", "GB", "TB"]
+
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{value:.2f} {unit}"
+        value /= 1024
+
+    return f"{value:.2f} TB"
+
+
+def remote_file_size(url: str, timeout: int = 60) -> int | None:
+    """Return remote file size when the server provides Content-Length."""
+    try:
+        response = requests.head(
+            url,
+            allow_redirects=True,
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        size = response.headers.get("Content-Length")
+        return int(size) if size is not None else None
+    except requests.RequestException:
+        return None
+
+
+def download_file(
+    url: str,
+    destination: Path,
+    chunk_size: int = 1024 * 1024,
+    timeout: int = 120,
+) -> Path:
+    """
+    Stream-download a file. Skips the download entirely if `destination`
+    already exists and matches the server-reported size. A partial '.part'
+    file is used so a failed/interrupted download is never mistaken for a
+    complete ZIP archive.
+    """
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    expected_remote_size = remote_file_size(url)
+
+    if destination.exists():
+        local_size = destination.stat().st_size
+
+        if expected_remote_size is None or local_size == expected_remote_size:
+            print(f"Already present, skipping download: {destination}")
+            return destination
+
+        print(
+            f"Existing file size ({human_size(local_size)}) does not match "
+            f"the server ({human_size(expected_remote_size)}); "
+            f"re-downloading."
+        )
+        destination.unlink()
+
+    partial_path = destination.with_suffix(destination.suffix + ".part")
+
+    if partial_path.exists():
+        partial_path.unlink()
+
+    print(f"\nDownloading:\n{url}")
+
+    try:
+        with requests.get(
+            url,
+            stream=True,
+            timeout=timeout,
+            allow_redirects=True,
+        ) as response:
+            response.raise_for_status()
+
+            total_size_header = response.headers.get("Content-Length")
+            total_size = (
+                int(total_size_header)
+                if total_size_header is not None
+                else expected_remote_size
+            )
+
+            if total_size is not None:
+                print(f"Expected download size: {human_size(total_size)}")
+
+            with open(partial_path, "wb") as file_handle:
+                progress = tqdm(
+                    total=total_size,
+                    unit="B",
+                    unit_scale=True,
+                    unit_divisor=1024,
+                    desc=destination.name,
+                )
+
+                for chunk in response.iter_content(chunk_size=chunk_size):
+                    if not chunk:
+                        continue
+
+                    file_handle.write(chunk)
+                    progress.update(len(chunk))
+
+                progress.close()
+
+        if not zipfile.is_zipfile(partial_path):
+            raise RuntimeError(
+                f"Downloaded file is not a valid ZIP archive: {partial_path}"
+            )
+
+        partial_path.replace(destination)
+        print(f"Saved archive: {destination}")
+        return destination
+
+    except Exception:
+        if partial_path.exists():
+            partial_path.unlink()
+        raise
+
+
+def safe_extract_zip(zip_path: Path, extraction_directory: Path) -> None:
+    """Extract ZIP while preventing path-traversal (zip-slip) entries."""
+    extraction_directory.mkdir(parents=True, exist_ok=True)
+    extraction_root = extraction_directory.resolve()
+
+    with zipfile.ZipFile(zip_path, "r") as archive:
+        members = archive.infolist()
+
+        for member in members:
+            member_destination = (
+                extraction_directory / member.filename
+            ).resolve()
+
+            if (
+                os.path.commonpath(
+                    [str(extraction_root), str(member_destination)]
+                )
+                != str(extraction_root)
+            ):
+                raise RuntimeError(
+                    f"Unsafe ZIP path detected: {member.filename}"
+                )
+
+        for member in tqdm(
+            members,
+            desc=f"Extracting {zip_path.name}",
+            unit="file",
+        ):
+            archive.extract(member, extraction_directory)
+
+
+def archive_marker(extract_root: Path, archive_name: str) -> Path:
+    """
+    A small marker file dropped after successful extraction. Its presence
+    means "already extracted" so re-running this script is a fast no-op
+    instead of re-unzipping thousands of files every time.
+    """
+    return extract_root / f".{archive_name}.extracted"
+
+
+def ensure_archive_downloaded_and_extracted(
+    archive_name: str,
+    url: str,
+    download_root: Path,
+    extract_root: Path,
+) -> None:
+    """
+    Generic worker: downloads `archive_name` from `url` into `download_root`
+    only if not already present, then extracts it into `extract_root` only
+    if not already extracted (per the marker file). Safe to call repeatedly
+    -- fully idempotent. Each dataset-specific ensure_*_dataset_available()
+    function below calls this twice (train + test archive).
+    """
+    archive_path = download_root / archive_name
+    marker_path = archive_marker(extract_root, archive_name)
+
+    if marker_path.exists():
+        print(f"Already extracted, skipping: {archive_name}")
+        return
+
+    download_file(url, archive_path)
+
+    print(f"\nExtracting {archive_path.name}...")
+    safe_extract_zip(archive_path, extract_root)
+
+    marker_path.write_text(
+        f"Extracted from {archive_path}\n",
+        encoding="utf-8",
+    )
+
+    print(f"Extraction complete: {archive_path.name}")
+
+
+# =============================================================================
+# DATASET-SPECIFIC ENTRY POINTS
+# =============================================================================
+
+def ensure_mnist_dataset_available() -> None:
+    print("=" * 78)
+    print("Checking MNISQ MNIST dataset")
+    print(f"Data root: {MNIST_DATA_ROOT.resolve()}")
+    print("=" * 78)
+
+    train_url = f"{OFFICIAL_BASE_URL}/{MNIST_TRAIN_ARCHIVE_NAME}"
+    test_url = f"{OFFICIAL_BASE_URL}/{MNIST_TEST_ARCHIVE_NAME}"
+
+    ensure_archive_downloaded_and_extracted(
+        MNIST_TRAIN_ARCHIVE_NAME,
+        train_url,
+        MNIST_DOWNLOAD_ROOT,
+        MNIST_EXTRACT_ROOT,
+    )
+    ensure_archive_downloaded_and_extracted(
+        MNIST_TEST_ARCHIVE_NAME,
+        test_url,
+        MNIST_DOWNLOAD_ROOT,
+        MNIST_EXTRACT_ROOT,
+    )
+
+    print(f"MNIST dataset ready. Extracted under: {MNIST_EXTRACT_ROOT.resolve()}")
+
+
+def ensure_fashionmnist_dataset_available() -> None:
+    print("=" * 78)
+    print("Checking MNISQ Fashion-MNIST dataset")
+    print(f"Data root: {FASHIONMNIST_DATA_ROOT.resolve()}")
+    print("=" * 78)
+
+    train_url = f"{OFFICIAL_BASE_URL}/{FASHIONMNIST_TRAIN_ARCHIVE_NAME}"
+    test_url = f"{OFFICIAL_BASE_URL}/{FASHIONMNIST_TEST_ARCHIVE_NAME}"
+
+    ensure_archive_downloaded_and_extracted(
+        FASHIONMNIST_TRAIN_ARCHIVE_NAME,
+        train_url,
+        FASHIONMNIST_DOWNLOAD_ROOT,
+        FASHIONMNIST_EXTRACT_ROOT,
+    )
+    ensure_archive_downloaded_and_extracted(
+        FASHIONMNIST_TEST_ARCHIVE_NAME,
+        test_url,
+        FASHIONMNIST_DOWNLOAD_ROOT,
+        FASHIONMNIST_EXTRACT_ROOT,
+    )
+
+    print(f"Fashion-MNIST dataset ready. Extracted under: {FASHIONMNIST_EXTRACT_ROOT.resolve()}")
+
+
+def ensure_kuzushiji_dataset_available() -> None:
+    print("=" * 78)
+    print("Checking MNISQ Kuzushiji-MNIST dataset")
+    print(f"Data root: {KUZUSHIJI_DATA_ROOT.resolve()}")
+    print("=" * 78)
+
+    train_url = f"{OFFICIAL_BASE_URL}/{KUZUSHIJI_TRAIN_ARCHIVE_NAME}"
+    test_url = f"{OFFICIAL_BASE_URL}/{KUZUSHIJI_TEST_ARCHIVE_NAME}"
+
+    ensure_archive_downloaded_and_extracted(
+        KUZUSHIJI_TRAIN_ARCHIVE_NAME,
+        train_url,
+        KUZUSHIJI_DOWNLOAD_ROOT,
+        KUZUSHIJI_EXTRACT_ROOT,
+    )
+    ensure_archive_downloaded_and_extracted(
+        KUZUSHIJI_TEST_ARCHIVE_NAME,
+        test_url,
+        KUZUSHIJI_DOWNLOAD_ROOT,
+        KUZUSHIJI_EXTRACT_ROOT,
+    )
+
+    print(f"Kuzushiji-MNIST dataset ready. Extracted under: {KUZUSHIJI_EXTRACT_ROOT.resolve()}")
+
+
+def ensure_all_mnisq_datasets_available() -> None:
+    """Runs all three dataset checks/downloads/extractions in sequence."""
+    ensure_mnist_dataset_available()
+    print()
+    ensure_fashionmnist_dataset_available()
+    print()
+    ensure_kuzushiji_dataset_available()
+
+    print("\n" + "=" * 78)
+    print("All three MNISQ datasets ready.")
+    print(f"  MNIST           -> {MNIST_EXTRACT_ROOT.resolve()}")
+    print(f"  Fashion-MNIST   -> {FASHIONMNIST_EXTRACT_ROOT.resolve()}")
+    print(f"  Kuzushiji-MNIST -> {KUZUSHIJI_EXTRACT_ROOT.resolve()}")
+    print("=" * 78)
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
 if __name__ == "__main__":
+    ensure_all_mnisq_datasets_available()
     main()
