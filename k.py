@@ -73,7 +73,9 @@ USE_FULL_DATASET = True
 
 # Only used when USE_FULL_DATASET is False.
 TRAIN_SAMPLES_PER_CLASS = 50
-TEST_SAMPLES_PER_CLASS = 20
+
+# Only used when USE_FULL_DATASET is False.
+TEST_SAMPLES_PER_CLASS = 200
 
 # Peak-RAM budget for kernel computation. With the disk-backed memmap
 # kernel, this bounds the size of ONE block (block_size rows) held in RAM
