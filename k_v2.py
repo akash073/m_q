@@ -8,13 +8,6 @@ import re
 import socket
 import sys
 import time
-import io
-import pickle
-import zlib
-import gzip
-import bz2
-import lzma
-import traceback
 from pathlib import Path
 import requests
 import joblib
@@ -307,131 +300,6 @@ def find_model_artifacts(result_root: Path):
         )[0]
 
     return svm_path, train_states_path, model_npz_path
-
-
-# ============================================================
-# ROBUST / COMPATIBLE MODEL LOADING
-# ============================================================
-
-def _try_deserialize_bytes(payload: bytes, source_name: str):
-    """Try common serializers on an in-memory payload.
-
-    This is useful when a model file was manually compressed before being
-    written to disk.  It does NOT modify the saved model file.
-    """
-    errors = []
-
-    # 1) Let joblib handle an uncompressed in-memory stream.
-    try:
-        return joblib.load(io.BytesIO(payload))
-    except Exception as exc:
-        errors.append(f"joblib(BytesIO): {type(exc).__name__}: {exc}")
-
-    # 2) Standard pickle.
-    try:
-        return pickle.loads(payload)
-    except Exception as exc:
-        errors.append(f"pickle.loads: {type(exc).__name__}: {exc}")
-
-    # 3) Older Python/pickle compatibility.
-    try:
-        return pickle.loads(payload, encoding="latin1")
-    except Exception as exc:
-        errors.append(f"pickle.loads(latin1): {type(exc).__name__}: {exc}")
-
-    # 4) Optional cloudpickle fallback, if installed.
-    try:
-        import cloudpickle
-        return cloudpickle.loads(payload)
-    except Exception as exc:
-        errors.append(f"cloudpickle.loads: {type(exc).__name__}: {exc}")
-
-    raise RuntimeError(
-        f"Could not deserialize {source_name}. Attempts: " + " | ".join(errors)
-    )
-
-
-def load_classifier_compat(model_path: Path):
-    """Load an SVM model while handling several legacy/manual compression cases.
-
-    First, normal joblib.load() is used. If that fails, the function inspects
-    the raw file and tries zlib/gzip/bz2/lzma decompression followed by joblib
-    or pickle deserialization. This is intended for previously saved artifacts
-    whose bytes are compressed outside normal joblib handling.
-    """
-    model_path = Path(model_path)
-
-    if not model_path.exists():
-        raise FileNotFoundError(f"Model file not found: {model_path}")
-
-    file_size = model_path.stat().st_size
-    print(f"Loading classifier: {model_path.resolve()}")
-    print(f"Model file size   : {file_size:,} bytes")
-
-    # Preferred path: ordinary joblib file.
-    try:
-        model = joblib.load(model_path)
-        print(f"Loaded with joblib: {type(model)}")
-        return model
-    except Exception as first_exc:
-        print(
-            f"Normal joblib.load failed: {type(first_exc).__name__}: {first_exc}"
-        )
-
-    raw = model_path.read_bytes()
-    print(f"First 16 raw bytes: {raw[:16]!r}")
-
-    decompression_attempts = []
-
-    # zlib streams often start with 0x78 (for example b'x^', b'x\x9c').
-    try:
-        payload = zlib.decompress(raw)
-        print(
-            f"zlib decompression succeeded: {len(raw):,} -> "
-            f"{len(payload):,} bytes; first 16 decompressed bytes={payload[:16]!r}"
-        )
-        return _try_deserialize_bytes(payload, f"zlib payload from {model_path.name}")
-    except Exception as exc:
-        decompression_attempts.append(
-            f"zlib: {type(exc).__name__}: {exc}"
-        )
-
-    # Other common compression formats.
-    for name, decoder in (
-        ("gzip", gzip.decompress),
-        ("bz2", bz2.decompress),
-        ("lzma", lzma.decompress),
-    ):
-        try:
-            payload = decoder(raw)
-            print(
-                f"{name} decompression succeeded: {len(raw):,} -> "
-                f"{len(payload):,} bytes"
-            )
-            return _try_deserialize_bytes(
-                payload, f"{name} payload from {model_path.name}"
-            )
-        except Exception as exc:
-            decompression_attempts.append(
-                f"{name}: {type(exc).__name__}: {exc}"
-            )
-
-    # Last attempt: perhaps the raw bytes are a pickle that joblib rejected.
-    try:
-        return _try_deserialize_bytes(raw, f"raw bytes from {model_path.name}")
-    except Exception as raw_exc:
-        raise RuntimeError(
-            "Unable to load the saved classifier. The file exists, but its "
-            "serialization is not readable by the current environment.\n"
-            f"File: {model_path.resolve()}\n"
-            f"Raw first 32 bytes: {raw[:32]!r}\n"
-            f"Decompression attempts: {' | '.join(decompression_attempts)}\n"
-            f"Raw deserialization error: {raw_exc}\n"
-            "If this still fails, the reliable fix is to load the model in the "
-            "same Python/joblib/scikit-learn environment used during training "
-            "and re-save it with joblib.dump(model, path)."
-        ) from raw_exc
-
 
 # ============================================================
 # QASM DISCOVERY / LABEL MATCHING
@@ -889,35 +757,82 @@ def extract_energy_data(tracker, emissions_value):
 
 
 def predict_with_energy(classifier, kernel_row, dataset_name):
-    tracker = None
-    if CODECARBON_AVAILABLE:
-        try:
-            tracker = EmissionsTracker(
-                project_name=f"mnisq_{dataset_name}_q1_fingerprinting",
-                output_dir=str(OUTPUT_ROOT / "codecarbon"),
-                output_file=f"{dataset_name.lower().replace('-', '_')}.csv",
-                log_level="error",
-                save_to_file=True,
-            )
-            tracker.start()
-        except Exception:
-            tracker = None
+    """
+    Predict one sample and measure prediction latency only.
 
+    Energy is measured once around the complete dataset inference loop.
+    """
     t0 = time.perf_counter()
+
     prediction_output = classifier.predict(kernel_row)
     pred = int(np.asarray(prediction_output).reshape(-1)[0])
+
     exec_time = time.perf_counter() - t0
+    return pred, exec_time
 
-    if tracker is not None:
-        try:
-            emissions = tracker.stop()
-            cpu_e, gpu_e, ram_e, total_e, ci = extract_energy_data(tracker, emissions)
-        except Exception:
-            emissions, cpu_e, gpu_e, ram_e, total_e, ci = 0, 0, 0, 0, 0, None
-    else:
-        emissions, cpu_e, gpu_e, ram_e, total_e, ci = 0, 0, 0, 0, 0, None
 
-    return pred, exec_time, cpu_e, gpu_e, ram_e, total_e, emissions, ci
+def start_dataset_energy_tracker(dataset_name):
+    """Start CodeCarbon once for the complete dataset inference workload."""
+    if not CODECARBON_AVAILABLE:
+        print("[CodeCarbon] Not available; energy values will remain 0.")
+        return None
+
+    try:
+        codecarbon_dir = OUTPUT_ROOT / "codecarbon"
+        codecarbon_dir.mkdir(parents=True, exist_ok=True)
+
+        tracker = EmissionsTracker(
+            project_name=f"mnisq_{dataset_name}_q1_fingerprinting",
+            output_dir=str(codecarbon_dir),
+            output_file=f"{dataset_name.lower().replace('-', '_')}_dataset.csv",
+            log_level="error",
+            save_to_file=True,
+        )
+        tracker.start()
+        return tracker
+    except Exception as exc:
+        print(f"[CodeCarbon warning] Could not start tracker: {exc}")
+        return None
+
+
+def stop_dataset_energy_tracker(tracker):
+    """Stop CodeCarbon and return dataset-level energy totals."""
+    if tracker is None:
+        return 0.0, 0.0, 0.0, 0.0, 0.0, None
+
+    try:
+        emissions = tracker.stop()
+        fd = getattr(tracker, "final_emissions_data", None)
+
+        if fd is None:
+            print("[CodeCarbon warning] final_emissions_data is unavailable.")
+            return 0.0, 0.0, 0.0, 0.0, float(emissions or 0.0), None
+
+        cpu_e = float(getattr(fd, "cpu_energy", 0) or 0)
+        gpu_e = float(getattr(fd, "gpu_energy", 0) or 0)
+        ram_e = float(getattr(fd, "ram_energy", 0) or 0)
+        total_e = float(getattr(fd, "energy_consumed", 0) or 0)
+        emissions_val = float(emissions or 0)
+
+        carbon_intensity = None
+        if total_e > 0:
+            carbon_intensity = emissions_val / total_e
+
+        print("\nCodeCarbon dataset totals:")
+        print(f"  CPU energy   : {cpu_e:.12f} kWh")
+        print(f"  GPU energy   : {gpu_e:.12f} kWh")
+        print(f"  RAM energy   : {ram_e:.12f} kWh")
+        print(f"  Total energy : {total_e:.12f} kWh")
+        print(f"  Emissions    : {emissions_val:.12f} kgCO2")
+        if carbon_intensity is not None:
+            print(f"  Carbon int.  : {carbon_intensity:.6f} kgCO2/kWh")
+
+        return cpu_e, gpu_e, ram_e, total_e, emissions_val, carbon_intensity
+
+    except Exception as exc:
+        print(f"[CodeCarbon warning] Could not stop/read tracker: {exc}")
+        return 0.0, 0.0, 0.0, 0.0, 0.0, None
+
 
 # ============================================================
 # TELEMETRY ROW
@@ -1094,7 +1009,7 @@ def test_one_dataset(dataset_name: str, config: dict) -> pd.DataFrame:
     if model_npz_path:
         print(f"Model metadata  : {model_npz_path.name}")
 
-    classifier = load_classifier_compat(svm_path)
+    classifier = joblib.load(svm_path)
     train_states = np.load(train_states_path, allow_pickle=False)
 
     if train_states.ndim != 2 or train_states.shape[1] != 2 ** N_QUBITS:
@@ -1125,6 +1040,10 @@ def test_one_dataset(dataset_name: str, config: dict) -> pd.DataFrame:
     cache_root = result_root / "fingerprinting_test_state_cache_q1"
     rows = []
 
+    # Start CodeCarbon once for the complete dataset inference workload.
+    dataset_tracker = start_dataset_energy_tracker(dataset_name)
+    full_inference_start = time.perf_counter()
+
     for i, sample in tqdm(
         selected.iterrows(),
         total=len(selected),
@@ -1133,15 +1052,14 @@ def test_one_dataset(dataset_name: str, config: dict) -> pd.DataFrame:
     ):
         qasm_path = Path(sample["qasm_path"])
 
-        # Circuit simulation + q1 reduction is required to build the kernel row.
-        # execution_time_sec below intentionally measures classifier prediction,
-        # matching the user's earlier telemetry pattern.
+        # Full inference workload:
+        # QASM execution -> q=1 reduction -> fidelity kernel -> SVM prediction
         q1_state = execute_qasm_to_q1(qasm_path, cache_root)
         kernel_row = fidelity_kernel_row(q1_state, train_states)
 
         confidence, margin, entropy = prediction_quality(classifier, kernel_row)
 
-        pred, exec_time, cpu_e, gpu_e, ram_e, total_e, emissions, ci = predict_with_energy(
+        pred, exec_time = predict_with_energy(
             classifier,
             kernel_row,
             dataset_name,
@@ -1159,17 +1077,68 @@ def test_one_dataset(dataset_name: str, config: dict) -> pd.DataFrame:
             confidence=confidence,
             margin=margin,
             entropy=entropy,
-            cpu_energy=cpu_e,
-            gpu_energy=gpu_e,
-            ram_energy=ram_e,
-            total_energy=total_e,
-            emissions=emissions,
-            carbon_intensity=ci,
+            cpu_energy=0.0,
+            gpu_energy=0.0,
+            ram_energy=0.0,
+            total_energy=0.0,
+            emissions=0.0,
+            carbon_intensity=None,
             svm_path=svm_path,
             train_states_path=train_states_path,
         ))
 
+    full_inference_time = time.perf_counter() - full_inference_start
+
+    (
+        dataset_cpu_e,
+        dataset_gpu_e,
+        dataset_ram_e,
+        dataset_total_e,
+        dataset_emissions,
+        dataset_ci,
+    ) = stop_dataset_energy_tracker(dataset_tracker)
+
     df = pd.DataFrame(rows)
+
+    # Allocate the measured dataset totals equally across sample rows.
+    # Summing the columns reproduces the exact dataset-level totals.
+    n_rows = len(df)
+
+    if n_rows > 0:
+        df["cpu_energy_kwh"] = dataset_cpu_e / n_rows
+        df["gpu_energy_kwh"] = dataset_gpu_e / n_rows
+        df["ram_energy_kwh"] = dataset_ram_e / n_rows
+        df["total_energy_kwh"] = dataset_total_e / n_rows
+        df["total_emissions_kg"] = dataset_emissions / n_rows
+        df["carbon_intensity_kgco2_kwh"] = dataset_ci
+
+        df["energy_per_token_kwh"] = np.where(
+            df["total_tokens"] > 0,
+            df["total_energy_kwh"] / df["total_tokens"],
+            0.0,
+        )
+
+        df["joules_per_token"] = df["energy_per_token_kwh"] * 3_600_000
+
+        df["gpu_energy_pct_of_total"] = np.where(
+            df["total_energy_kwh"] > 0,
+            (df["gpu_energy_kwh"] / df["total_energy_kwh"]) * 100,
+            0.0,
+        )
+
+        df["cpu_energy_pct_of_total"] = np.where(
+            df["total_energy_kwh"] > 0,
+            (df["cpu_energy_kwh"] / df["total_energy_kwh"]) * 100,
+            0.0,
+        )
+
+    # Keep dataset-level totals explicitly for analysis.
+    df["dataset_total_cpu_energy_kwh"] = dataset_cpu_e
+    df["dataset_total_gpu_energy_kwh"] = dataset_gpu_e
+    df["dataset_total_ram_energy_kwh"] = dataset_ram_e
+    df["dataset_total_energy_kwh"] = dataset_total_e
+    df["dataset_total_emissions_kg"] = dataset_emissions
+    df["dataset_inference_time_sec"] = full_inference_time
 
     # Backfill model-level metrics into all rows for this dataset.
     y_true = df["true_label"].astype(int)
@@ -1226,14 +1195,8 @@ def main():
         try:
             all_results.append(test_one_dataset(dataset_name, config))
         except Exception as exc:
-            error_trace = traceback.format_exc()
-            failures.append({
-                "dataset": dataset_name,
-                "error": repr(exc),
-                "traceback": error_trace,
-            })
+            failures.append({"dataset": dataset_name, "error": repr(exc)})
             print(f"\n[{dataset_name} FAILED] {type(exc).__name__}: {exc}")
-            print(error_trace)
 
     if all_results:
         print('success')
