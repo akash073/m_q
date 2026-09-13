@@ -8,8 +8,15 @@ import re
 import socket
 import sys
 import time
+import io
+import pickle
+import zlib
+import gzip
+import bz2
+import lzma
+import traceback
 from pathlib import Path
-
+import requests
 import joblib
 import numpy as np
 import pandas as pd
@@ -17,7 +24,7 @@ import pennylane as qml
 import psutil
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from tqdm.auto import tqdm
-
+import zipfile
 # ============================================================
 # CONFIGURATION
 # ============================================================
@@ -59,7 +66,7 @@ DATASET_CONFIGS = {
         "result_roots": [
             PROJECT_ROOT / "mnisq_mnist_results_q1",
         ],
-        "archive_tokens": ["base_test_mnist_784", "mnist_784"],
+        "archive_tokens": ["base_test_mnist_784"],
         "dataset_tokens": ["mnist_784"],
         "class_names": [str(i) for i in range(10)],
     },
@@ -72,7 +79,7 @@ DATASET_CONFIGS = {
             PROJECT_ROOT / "mnisq_fashionmnist_results_q1",
             PROJECT_ROOT / "mnisq_fashion_results_q1",
         ],
-        "archive_tokens": ["base_test_fashion-mnist", "fashion-mnist"],
+        "archive_tokens": ["base_test_fashion-mnist"],
         "dataset_tokens": ["fashion-mnist", "fashionmnist"],
         "class_names": [
             "T-shirt/top", "Trouser", "Pullover", "Dress", "Coat",
@@ -86,7 +93,7 @@ DATASET_CONFIGS = {
         "result_roots": [
             PROJECT_ROOT / "mnisq_kuzushiji_results_q1",
         ],
-        "archive_tokens": ["base_test_kuzushiji-mnist", "kuzushiji-mnist"],
+        "archive_tokens": ["base_test_kuzushiji-mnist"],
         "dataset_tokens": ["kuzushiji-mnist", "kuzushiji"],
         "class_names": [f"Class {i}" for i in range(10)],
     },
@@ -300,6 +307,131 @@ def find_model_artifacts(result_root: Path):
         )[0]
 
     return svm_path, train_states_path, model_npz_path
+
+
+# ============================================================
+# ROBUST / COMPATIBLE MODEL LOADING
+# ============================================================
+
+def _try_deserialize_bytes(payload: bytes, source_name: str):
+    """Try common serializers on an in-memory payload.
+
+    This is useful when a model file was manually compressed before being
+    written to disk.  It does NOT modify the saved model file.
+    """
+    errors = []
+
+    # 1) Let joblib handle an uncompressed in-memory stream.
+    try:
+        return joblib.load(io.BytesIO(payload))
+    except Exception as exc:
+        errors.append(f"joblib(BytesIO): {type(exc).__name__}: {exc}")
+
+    # 2) Standard pickle.
+    try:
+        return pickle.loads(payload)
+    except Exception as exc:
+        errors.append(f"pickle.loads: {type(exc).__name__}: {exc}")
+
+    # 3) Older Python/pickle compatibility.
+    try:
+        return pickle.loads(payload, encoding="latin1")
+    except Exception as exc:
+        errors.append(f"pickle.loads(latin1): {type(exc).__name__}: {exc}")
+
+    # 4) Optional cloudpickle fallback, if installed.
+    try:
+        import cloudpickle
+        return cloudpickle.loads(payload)
+    except Exception as exc:
+        errors.append(f"cloudpickle.loads: {type(exc).__name__}: {exc}")
+
+    raise RuntimeError(
+        f"Could not deserialize {source_name}. Attempts: " + " | ".join(errors)
+    )
+
+
+def load_classifier_compat(model_path: Path):
+    """Load an SVM model while handling several legacy/manual compression cases.
+
+    First, normal joblib.load() is used. If that fails, the function inspects
+    the raw file and tries zlib/gzip/bz2/lzma decompression followed by joblib
+    or pickle deserialization. This is intended for previously saved artifacts
+    whose bytes are compressed outside normal joblib handling.
+    """
+    model_path = Path(model_path)
+
+    if not model_path.exists():
+        raise FileNotFoundError(f"Model file not found: {model_path}")
+
+    file_size = model_path.stat().st_size
+    print(f"Loading classifier: {model_path.resolve()}")
+    print(f"Model file size   : {file_size:,} bytes")
+
+    # Preferred path: ordinary joblib file.
+    try:
+        model = joblib.load(model_path)
+        print(f"Loaded with joblib: {type(model)}")
+        return model
+    except Exception as first_exc:
+        print(
+            f"Normal joblib.load failed: {type(first_exc).__name__}: {first_exc}"
+        )
+
+    raw = model_path.read_bytes()
+    print(f"First 16 raw bytes: {raw[:16]!r}")
+
+    decompression_attempts = []
+
+    # zlib streams often start with 0x78 (for example b'x^', b'x\x9c').
+    try:
+        payload = zlib.decompress(raw)
+        print(
+            f"zlib decompression succeeded: {len(raw):,} -> "
+            f"{len(payload):,} bytes; first 16 decompressed bytes={payload[:16]!r}"
+        )
+        return _try_deserialize_bytes(payload, f"zlib payload from {model_path.name}")
+    except Exception as exc:
+        decompression_attempts.append(
+            f"zlib: {type(exc).__name__}: {exc}"
+        )
+
+    # Other common compression formats.
+    for name, decoder in (
+        ("gzip", gzip.decompress),
+        ("bz2", bz2.decompress),
+        ("lzma", lzma.decompress),
+    ):
+        try:
+            payload = decoder(raw)
+            print(
+                f"{name} decompression succeeded: {len(raw):,} -> "
+                f"{len(payload):,} bytes"
+            )
+            return _try_deserialize_bytes(
+                payload, f"{name} payload from {model_path.name}"
+            )
+        except Exception as exc:
+            decompression_attempts.append(
+                f"{name}: {type(exc).__name__}: {exc}"
+            )
+
+    # Last attempt: perhaps the raw bytes are a pickle that joblib rejected.
+    try:
+        return _try_deserialize_bytes(raw, f"raw bytes from {model_path.name}")
+    except Exception as raw_exc:
+        raise RuntimeError(
+            "Unable to load the saved classifier. The file exists, but its "
+            "serialization is not readable by the current environment.\n"
+            f"File: {model_path.resolve()}\n"
+            f"Raw first 32 bytes: {raw[:32]!r}\n"
+            f"Decompression attempts: {' | '.join(decompression_attempts)}\n"
+            f"Raw deserialization error: {raw_exc}\n"
+            "If this still fails, the reliable fix is to load the model in the "
+            "same Python/joblib/scikit-learn environment used during training "
+            "and re-save it with joblib.dump(model, path)."
+        ) from raw_exc
+
 
 # ============================================================
 # QASM DISCOVERY / LABEL MATCHING
@@ -772,7 +904,8 @@ def predict_with_energy(classifier, kernel_row, dataset_name):
             tracker = None
 
     t0 = time.perf_counter()
-    pred = int(classifier.predict(kernel_row)[0])
+    prediction_output = classifier.predict(kernel_row)
+    pred = int(np.asarray(prediction_output).reshape(-1)[0])
     exec_time = time.perf_counter() - t0
 
     if tracker is not None:
@@ -961,7 +1094,7 @@ def test_one_dataset(dataset_name: str, config: dict) -> pd.DataFrame:
     if model_npz_path:
         print(f"Model metadata  : {model_npz_path.name}")
 
-    classifier = joblib.load(svm_path)
+    classifier = load_classifier_compat(svm_path)
     train_states = np.load(train_states_path, allow_pickle=False)
 
     if train_states.ndim != 2 or train_states.shape[1] != 2 ** N_QUBITS:
@@ -1093,8 +1226,14 @@ def main():
         try:
             all_results.append(test_one_dataset(dataset_name, config))
         except Exception as exc:
-            failures.append({"dataset": dataset_name, "error": repr(exc)})
+            error_trace = traceback.format_exc()
+            failures.append({
+                "dataset": dataset_name,
+                "error": repr(exc),
+                "traceback": error_trace,
+            })
             print(f"\n[{dataset_name} FAILED] {type(exc).__name__}: {exc}")
+            print(error_trace)
 
     if all_results:
         print('success')
@@ -1145,5 +1284,294 @@ def main():
     print("\nDone.")
 
 
+
+
+
+# =============================================================================
+# DATASET-SPECIFIC ENTRY POINTS
+# =============================================================================
+OFFICIAL_BASE_URL = (
+    "https://qulacs-quantum-datasets.s3.us-west-1.amazonaws.com"
+)
+
+MNIST_DATA_ROOT = PROJECT_ROOT / "mnisq_mnist_data"
+MNIST_DOWNLOAD_ROOT = MNIST_DATA_ROOT / "downloads"
+MNIST_EXTRACT_ROOT = MNIST_DATA_ROOT / "extracted"
+MNIST_TRAIN_ARCHIVE_NAME = f"base_train_orig_mnist_784_{FIDELITY}.zip"
+MNIST_TEST_ARCHIVE_NAME = f"base_test_mnist_784_{FIDELITY}.zip"
+
+FASHIONMNIST_DATA_ROOT = PROJECT_ROOT / "mnisq_fashionmnist_data"
+FASHIONMNIST_DOWNLOAD_ROOT = FASHIONMNIST_DATA_ROOT / "downloads"
+FASHIONMNIST_EXTRACT_ROOT = FASHIONMNIST_DATA_ROOT / "extracted"
+FASHIONMNIST_TRAIN_ARCHIVE_NAME = f"base_train_orig_Fashion-MNIST_{FIDELITY}.zip"
+FASHIONMNIST_TEST_ARCHIVE_NAME = f"base_test_Fashion-MNIST_{FIDELITY}.zip"
+
+KUZUSHIJI_DATA_ROOT = PROJECT_ROOT / "mnisq_kuzushiji_data"
+KUZUSHIJI_DOWNLOAD_ROOT = KUZUSHIJI_DATA_ROOT / "downloads"
+KUZUSHIJI_EXTRACT_ROOT = KUZUSHIJI_DATA_ROOT / "extracted"
+KUZUSHIJI_TRAIN_ARCHIVE_NAME = f"base_train_orig_Kuzushiji-MNIST_{FIDELITY}.zip"
+KUZUSHIJI_TEST_ARCHIVE_NAME = f"base_test_Kuzushiji-MNIST_{FIDELITY}.zip"
+
+for folder in [
+    MNIST_DATA_ROOT, MNIST_DOWNLOAD_ROOT, MNIST_EXTRACT_ROOT,
+    FASHIONMNIST_DATA_ROOT, FASHIONMNIST_DOWNLOAD_ROOT, FASHIONMNIST_EXTRACT_ROOT,
+    KUZUSHIJI_DATA_ROOT, KUZUSHIJI_DOWNLOAD_ROOT, KUZUSHIJI_EXTRACT_ROOT,
+]:
+    folder.mkdir(parents=True, exist_ok=True)
+
+
+def remote_file_size(url: str, timeout: int = 60) -> int | None:
+    """Return remote file size when the server provides Content-Length."""
+    try:
+        response = requests.head(
+            url,
+            allow_redirects=True,
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        size = response.headers.get("Content-Length")
+        return int(size) if size is not None else None
+    except requests.RequestException:
+        return None
+def human_size(number_of_bytes: int | float) -> str:
+    value = float(number_of_bytes)
+    units = ["B", "KB", "MB", "GB", "TB"]
+
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{value:.2f} {unit}"
+        value /= 1024
+
+    return f"{value:.2f} TB"
+
+def archive_marker(extract_root: Path, archive_name: str) -> Path:
+    """
+    A small marker file dropped after successful extraction. Its presence
+    means "already extracted" so re-running this script is a fast no-op
+    instead of re-unzipping thousands of files every time.
+    """
+    return extract_root / f".{archive_name}.extracted"
+def download_file(
+    url: str,
+    destination: Path,
+    chunk_size: int = 1024 * 1024,
+    timeout: int = 120,
+) -> Path:
+    """
+    Stream-download a file. Skips the download entirely if `destination`
+    already exists and matches the server-reported size. A partial '.part'
+    file is used so a failed/interrupted download is never mistaken for a
+    complete ZIP archive.
+    """
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    expected_remote_size = remote_file_size(url)
+
+    if destination.exists():
+        local_size = destination.stat().st_size
+
+        if expected_remote_size is None or local_size == expected_remote_size:
+            print(f"Already present, skipping download: {destination}")
+            return destination
+
+        print(
+            f"Existing file size ({human_size(local_size)}) does not match "
+            f"the server ({human_size(expected_remote_size)}); "
+            f"re-downloading."
+        )
+        destination.unlink()
+
+    partial_path = destination.with_suffix(destination.suffix + ".part")
+
+    if partial_path.exists():
+        partial_path.unlink()
+
+    print(f"\nDownloading:\n{url}")
+
+    try:
+        with requests.get(
+            url,
+            stream=True,
+            timeout=timeout,
+            allow_redirects=True,
+        ) as response:
+            response.raise_for_status()
+
+            total_size_header = response.headers.get("Content-Length")
+            total_size = (
+                int(total_size_header)
+                if total_size_header is not None
+                else expected_remote_size
+            )
+
+            if total_size is not None:
+                print(f"Expected download size: {human_size(total_size)}")
+
+            with open(partial_path, "wb") as file_handle:
+                progress = tqdm(
+                    total=total_size,
+                    unit="B",
+                    unit_scale=True,
+                    unit_divisor=1024,
+                    desc=destination.name,
+                )
+
+                for chunk in response.iter_content(chunk_size=chunk_size):
+                    if not chunk:
+                        continue
+
+                    file_handle.write(chunk)
+                    progress.update(len(chunk))
+
+                progress.close()
+
+        if not zipfile.is_zipfile(partial_path):
+            raise RuntimeError(
+                f"Downloaded file is not a valid ZIP archive: {partial_path}"
+            )
+
+        partial_path.replace(destination)
+        print(f"Saved archive: {destination}")
+        return destination
+
+    except Exception:
+        if partial_path.exists():
+            partial_path.unlink()
+        raise
+
+
+def safe_extract_zip(zip_path: Path, extraction_directory: Path) -> None:
+    """Extract ZIP while preventing path-traversal (zip-slip) entries."""
+    extraction_directory.mkdir(parents=True, exist_ok=True)
+    extraction_root = extraction_directory.resolve()
+
+    with zipfile.ZipFile(zip_path, "r") as archive:
+        members = archive.infolist()
+
+        for member in members:
+            member_destination = (
+                extraction_directory / member.filename
+            ).resolve()
+
+            if (
+                os.path.commonpath(
+                    [str(extraction_root), str(member_destination)]
+                )
+                != str(extraction_root)
+            ):
+                raise RuntimeError(
+                    f"Unsafe ZIP path detected: {member.filename}"
+                )
+
+        for member in tqdm(
+            members,
+            desc=f"Extracting {zip_path.name}",
+            unit="file",
+        ):
+            archive.extract(member, extraction_directory)
+
+def ensure_archive_downloaded_and_extracted(
+    archive_name: str,
+    url: str,
+    download_root: Path,
+    extract_root: Path,
+) -> None:
+    """
+    Generic worker: downloads `archive_name` from `url` into `download_root`
+    only if not already present, then extracts it into `extract_root` only
+    if not already extracted (per the marker file). Safe to call repeatedly
+    -- fully idempotent. Each dataset-specific ensure_*_dataset_available()
+    function below calls this for the test archive only.
+    """
+    archive_path = download_root / archive_name
+    marker_path = archive_marker(extract_root, archive_name)
+
+    if marker_path.exists():
+        print(f"Already extracted, skipping: {archive_name}")
+        return
+
+    download_file(url, archive_path)
+
+    print(f"\nExtracting {archive_path.name}...")
+    safe_extract_zip(archive_path, extract_root)
+
+    marker_path.write_text(
+        f"Extracted from {archive_path}\n",
+        encoding="utf-8",
+    )
+
+    print(f"Extraction complete: {archive_path.name}")
+
+
+def ensure_mnist_dataset_available() -> None:
+    print("=" * 78)
+    print("Checking MNISQ MNIST TEST dataset")
+    print(f"Data root: {MNIST_DATA_ROOT.resolve()}")
+    print("=" * 78)
+
+    test_url = f"{OFFICIAL_BASE_URL}/{MNIST_TEST_ARCHIVE_NAME}"
+
+    ensure_archive_downloaded_and_extracted(
+        MNIST_TEST_ARCHIVE_NAME,
+        test_url,
+        MNIST_DOWNLOAD_ROOT,
+        MNIST_EXTRACT_ROOT,
+    )
+
+    print(f"MNIST test dataset ready. Extracted under: {MNIST_EXTRACT_ROOT.resolve()}")
+
+
+def ensure_fashionmnist_dataset_available() -> None:
+    print("=" * 78)
+    print("Checking MNISQ Fashion-MNIST TEST dataset")
+    print(f"Data root: {FASHIONMNIST_DATA_ROOT.resolve()}")
+    print("=" * 78)
+
+    test_url = f"{OFFICIAL_BASE_URL}/{FASHIONMNIST_TEST_ARCHIVE_NAME}"
+
+    ensure_archive_downloaded_and_extracted(
+        FASHIONMNIST_TEST_ARCHIVE_NAME,
+        test_url,
+        FASHIONMNIST_DOWNLOAD_ROOT,
+        FASHIONMNIST_EXTRACT_ROOT,
+    )
+
+    print(f"Fashion-MNIST test dataset ready. Extracted under: {FASHIONMNIST_EXTRACT_ROOT.resolve()}")
+
+
+def ensure_kuzushiji_dataset_available() -> None:
+    print("=" * 78)
+    print("Checking MNISQ Kuzushiji-MNIST TEST dataset")
+    print(f"Data root: {KUZUSHIJI_DATA_ROOT.resolve()}")
+    print("=" * 78)
+
+    test_url = f"{OFFICIAL_BASE_URL}/{KUZUSHIJI_TEST_ARCHIVE_NAME}"
+
+    ensure_archive_downloaded_and_extracted(
+        KUZUSHIJI_TEST_ARCHIVE_NAME,
+        test_url,
+        KUZUSHIJI_DOWNLOAD_ROOT,
+        KUZUSHIJI_EXTRACT_ROOT,
+    )
+
+    print(f"Kuzushiji-MNIST test dataset ready. Extracted under: {KUZUSHIJI_EXTRACT_ROOT.resolve()}")
+
+
+def ensure_all_mnisq_datasets_available() -> None:
+    """Runs all three dataset checks/downloads/extractions in sequence."""
+    ensure_mnist_dataset_available()
+    print()
+    ensure_fashionmnist_dataset_available()
+    print()
+    ensure_kuzushiji_dataset_available()
+
+    print("\n" + "=" * 78)
+    print("All three MNISQ TEST datasets ready.")
+    print(f"  MNIST           -> {MNIST_EXTRACT_ROOT.resolve()}")
+    print(f"  Fashion-MNIST   -> {FASHIONMNIST_EXTRACT_ROOT.resolve()}")
+    print(f"  Kuzushiji-MNIST -> {KUZUSHIJI_EXTRACT_ROOT.resolve()}")
+    print("=" * 78)
+
 if __name__ == "__main__":
+    ensure_all_mnisq_datasets_available()
     main()
