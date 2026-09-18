@@ -15,4 +15,7 @@ test_results/9f56743a/dnn_cnn_dataset_9f56743a_kmnist_vanilla.csv
 test_results/9f56743a/dnn_cnn_dataset_9f56743a_mnist_vanilla.csv
 mnisq_mnist_results_q1/*
 mnisq_fashionmnist_results_q1/*
+runs/**/*
+yolo_classification_data/**/*
+raw_data/**/*
 
