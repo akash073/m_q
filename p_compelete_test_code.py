@@ -1872,8 +1872,6 @@ Expected saved models:
     mobilenet_v2_kmnist_cpu.pt
 """
 
-from __future__ import annotations
-
 import hashlib
 import os
 import platform
@@ -5476,8 +5474,6 @@ The CSV schema is kept identical to the existing 83-column
 CNN/DNN/YOLO/MobileNet/Qwen/Moondream telemetry schema.
 """
 
-from __future__ import annotations
-
 import hashlib
 import os
 import platform
@@ -6576,9 +6572,6 @@ def tinyclip_main():
     print("\nAll TinyCLIP tests complete.")
     #print("Summary:", summary_path.resolve())
 
-
-
-from __future__ import annotations
 
 import hashlib
 import json
