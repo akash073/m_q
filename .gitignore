@@ -18,4 +18,4 @@ mnisq_fashionmnist_results_q1/*
 runs/**/*
 yolo_classification_data/**/*
 raw_data/**/*
-
+__pycache__
