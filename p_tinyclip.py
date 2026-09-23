@@ -1085,15 +1085,15 @@ def main():
     print("Parameters:", MODEL_PARAMETERS)
     # print("Telemetry columns:", len(REFERENCE_COLUMNS))
 
-    # summaries = []
+    summaries = []
 
-    # for dataset_name, config in DATASET_CONFIGS.items():
-    #     summaries.append(
-    #         test_dataset(
-    #             dataset_name,
-    #             config,
-    #         )
-    #     )
+    for dataset_name, config in DATASET_CONFIGS.items():
+        summaries.append(
+            test_dataset(
+                dataset_name,
+                config,
+            )
+        )
 
     # summary_path = (
     #     DEVICE_LOG_DIR
