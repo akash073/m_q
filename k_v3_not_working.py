@@ -8,9 +8,8 @@ import re
 import socket
 import sys
 import time
-import traceback
 from pathlib import Path
-
+import requests
 import joblib
 import numpy as np
 import pandas as pd
@@ -18,7 +17,7 @@ import pennylane as qml
 import psutil
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from tqdm.auto import tqdm
-
+import zipfile
 # ============================================================
 # CONFIGURATION
 # ============================================================
@@ -29,6 +28,10 @@ N_QUBITS = 1
 N_CLASSES = 10
 FIDELITY = "f90"
 
+# Official MNISQ test-set size per dataset (used only for the diagnostic
+# shortfall warning below -- does not affect selection behavior).
+EXPECTED_TEST_TOTAL = 10000
+
 # --- Test-set size control -----------------------------------------------
 # USE_ALL_TEST_SAMPLES = True:  use every discovered test sample per dataset
 #     (dataset test counts are allowed to differ from each other).
@@ -37,7 +40,7 @@ FIDELITY = "f90"
 #     for TEST_SAMPLES_PER_CLASS * N_CLASSES total samples per dataset
 #     (10 per class x 10 classes = 100 total, by default).
 USE_ALL_TEST_SAMPLES = True
-TEST_SAMPLES_PER_CLASS = 200#10
+TEST_SAMPLES_PER_CLASS = 200  # 10
 
 PENNYLANE_DEVICE = "default.qubit"
 
@@ -340,23 +343,29 @@ def discover_test_samples(data_root: Path, config: dict) -> pd.DataFrame:
 
     def path_matches_test(p: Path) -> bool:
         s = str(p).lower()
-        # Strictly accept TEST-set files only.  The specific base_test_* token
-        # is preferred; the fallback still requires both "test" and the
-        # dataset token, so training QASM files cannot be selected.
         if any(tok in s for tok in archive_tokens):
             return True
-        return (
-            "test" in s
-            and any(tok in s for tok in dataset_tokens)
-            and FIDELITY.lower() in s
-        )
+        return "test" in s and any(tok in s for tok in dataset_tokens) and FIDELITY.lower() in s
 
     qasm_files = [p for p in qasm_all if path_matches_test(p)]
+    used_fallback = False
     if not qasm_files:
         # Last-resort fallback: all QASM files containing test.
         qasm_files = [p for p in qasm_all if "test" in str(p).lower()]
+        used_fallback = True
     if not qasm_files:
         raise FileNotFoundError(f"No test QASM files found under {data_root}")
+
+    # DIAGNOSTIC: makes it visible when strict token matching found nothing
+    # and the script fell back to a looser "test" substring match -- this
+    # is a common silent cause of a smaller-than-expected discovered count.
+    if used_fallback:
+        print(
+            f"  [diagnostic] Strict archive/dataset token match found 0 files "
+            f"under {data_root}; fell back to a loose 'test' substring match "
+            f"({len(qasm_files):,} files). Check archive_tokens/dataset_tokens "
+            f"for this dataset if the final count looks too low."
+        )
 
     label_files = []
     for p in all_files:
@@ -401,6 +410,17 @@ def discover_test_samples(data_root: Path, config: dict) -> pd.DataFrame:
         raise RuntimeError(
             f"QASM files were found under {data_root}, but no QASM-label pairs were created."
         )
+
+    # DIAGNOSTIC: this is the actual source of a smaller-than-10,000 count
+    # for most cases -- QASM files whose id didn't have a matching label
+    # file (or vice versa) are silently excluded above, so surface the
+    # number explicitly here instead of just a generic warning.
+    print(
+        f"  [diagnostic] {data_root.name}: {len(qasm_files):,} test QASM files found, "
+        f"{len(label_files):,} test label files found, "
+        f"{len(df):,} QASM-label pairs matched, "
+        f"{unmatched:,} QASM files unmatched."
+    )
 
     if unmatched:
         print(f"Warning: {unmatched} test QASM files were unmatched in {data_root.name}.")
@@ -450,6 +470,18 @@ def select_test_samples(df: pd.DataFrame, dataset_name: str) -> pd.DataFrame:
             .reset_index(drop=True)
         )
         print(f"{dataset_name}: using ALL {len(selected):,} discovered test samples.")
+
+        # DIAGNOSTIC: explicit shortfall warning against the official
+        # MNISQ test-set size, so a gap is never silent.
+        if len(selected) < EXPECTED_TEST_TOTAL:
+            shortfall = EXPECTED_TEST_TOTAL - len(selected)
+            print(
+                f"  [diagnostic] {dataset_name}: discovered {len(selected):,} test "
+                f"samples, which is {shortfall:,} short of the expected "
+                f"{EXPECTED_TEST_TOTAL:,} for the official MNISQ test set. "
+                f"See the QASM/label match counts printed above for where "
+                f"samples were dropped."
+            )
     else:
         selected = balanced_sample(
             df,
@@ -725,35 +757,99 @@ def extract_energy_data(tracker, emissions_value):
 
 
 def predict_with_energy(classifier, kernel_row, dataset_name):
-    tracker = None
-    if CODECARBON_AVAILABLE:
-        try:
-            tracker = EmissionsTracker(
-                project_name=f"mnisq_{dataset_name}_q1_fingerprinting",
-                output_dir=str(OUTPUT_ROOT / "codecarbon"),
-                output_file=f"{dataset_name.lower().replace('-', '_')}.csv",
-                log_level="error",
-                save_to_file=True,
-            )
-            tracker.start()
-        except Exception:
-            tracker = None
+    """
+    Predict one sample and measure prediction latency only.
 
+    Energy is measured once around the complete dataset inference loop.
+    """
     t0 = time.perf_counter()
+
     prediction_output = classifier.predict(kernel_row)
     pred = int(np.asarray(prediction_output).reshape(-1)[0])
+
     exec_time = time.perf_counter() - t0
+    return pred, exec_time
 
-    if tracker is not None:
-        try:
-            emissions = tracker.stop()
-            cpu_e, gpu_e, ram_e, total_e, ci = extract_energy_data(tracker, emissions)
-        except Exception:
-            emissions, cpu_e, gpu_e, ram_e, total_e, ci = 0, 0, 0, 0, 0, None
-    else:
-        emissions, cpu_e, gpu_e, ram_e, total_e, ci = 0, 0, 0, 0, 0, None
 
-    return pred, exec_time, cpu_e, gpu_e, ram_e, total_e, emissions, ci
+def start_dataset_energy_tracker(dataset_name):
+    """Start CodeCarbon once for the complete dataset inference workload."""
+    if not CODECARBON_AVAILABLE:
+        print("[CodeCarbon] Not available; energy values will remain 0.")
+        return None
+
+    try:
+        codecarbon_dir = OUTPUT_ROOT / "codecarbon"
+        codecarbon_dir.mkdir(parents=True, exist_ok=True)
+
+        tracker = EmissionsTracker(
+            project_name=f"mnisq_{dataset_name}_q1_fingerprinting",
+            output_dir=str(codecarbon_dir),
+            output_file=f"{dataset_name.lower().replace('-', '_')}_dataset.csv",
+            log_level="error",
+            save_to_file=True,
+            measure_power_secs=1,
+        )
+        tracker.start()
+        return tracker
+    except Exception as exc:
+        print(f"[CodeCarbon warning] Could not start tracker: {exc}")
+        return None
+
+
+def stop_dataset_energy_tracker(tracker):
+    """Stop CodeCarbon and return dataset-level energy totals plus power."""
+
+    if tracker is None:
+        return 0.0, 0.0, 0.0, 0.0, 0.0, None, 0.0
+
+    try:
+        emissions = tracker.stop()
+        fd = getattr(tracker, "final_emissions_data", None)
+
+        if fd is None:
+            print("[CodeCarbon warning] final_emissions_data is unavailable.")
+            return 0.0, 0.0, 0.0, 0.0, float(emissions or 0.0), None, 0.0
+
+        cpu_e = float(getattr(fd, "cpu_energy", 0) or 0)
+        gpu_e = float(getattr(fd, "gpu_energy", 0) or 0)
+        ram_e = float(getattr(fd, "ram_energy", 0) or 0)
+        total_e = float(getattr(fd, "energy_consumed", 0) or 0)
+        emissions_val = float(emissions or 0)
+
+        cpu_power = float(getattr(fd, "cpu_power", 0) or 0)
+        gpu_power = float(getattr(fd, "gpu_power", 0) or 0)
+        ram_power = float(getattr(fd, "ram_power", 0) or 0)
+
+        codecarbon_power_w = cpu_power + gpu_power + ram_power
+
+        carbon_intensity = None
+        if total_e > 0:
+            carbon_intensity = emissions_val / total_e
+
+        print("\nCodeCarbon dataset totals:")
+        print(f"  CPU energy   : {cpu_e:.12f} kWh")
+        print(f"  GPU energy   : {gpu_e:.12f} kWh")
+        print(f"  RAM energy   : {ram_e:.12f} kWh")
+        print(f"  Total energy : {total_e:.12f} kWh")
+        print(f"  CPU power    : {cpu_power:.4f} W")
+        print(f"  GPU power    : {gpu_power:.4f} W")
+        print(f"  RAM power    : {ram_power:.4f} W")
+        print(f"  Total power  : {codecarbon_power_w:.4f} W")
+
+        return (
+            cpu_e,
+            gpu_e,
+            ram_e,
+            total_e,
+            emissions_val,
+            carbon_intensity,
+            codecarbon_power_w,
+        )
+
+    except Exception as exc:
+        print(f"[CodeCarbon warning] Could not stop/read tracker: {exc}")
+
+        return 0.0, 0.0, 0.0, 0.0, 0.0, None, 0.0
 
 # ============================================================
 # TELEMETRY ROW
@@ -940,6 +1036,15 @@ def test_one_dataset(dataset_name: str, config: dict) -> pd.DataFrame:
         )
 
     discovered = discover_test_samples(data_root, config)
+
+    # DIAGNOSTIC: explicit pre-selection count, so you can see the true
+    # discovered total before select_test_samples() applies any subsetting
+    # (USE_ALL_TEST_SAMPLES vs. balanced '10 set').
+    print(
+        f"  [diagnostic] {dataset_name}: {len(discovered):,} test samples "
+        f"discovered on disk before selection."
+    )
+
     selected = select_test_samples(discovered, dataset_name)
     print(f"Total selected test samples: {len(selected):,}")
 
@@ -952,6 +1057,10 @@ def test_one_dataset(dataset_name: str, config: dict) -> pd.DataFrame:
     cache_root = result_root / "fingerprinting_test_state_cache_q1"
     rows = []
 
+    # Start CodeCarbon once for the complete dataset inference workload.
+    dataset_tracker = start_dataset_energy_tracker(dataset_name)
+    full_inference_start = time.perf_counter()
+
     for i, sample in tqdm(
         selected.iterrows(),
         total=len(selected),
@@ -960,15 +1069,14 @@ def test_one_dataset(dataset_name: str, config: dict) -> pd.DataFrame:
     ):
         qasm_path = Path(sample["qasm_path"])
 
-        # Circuit simulation + q1 reduction is required to build the kernel row.
-        # execution_time_sec below intentionally measures classifier prediction,
-        # matching the user's earlier telemetry pattern.
+        # Full inference workload:
+        # QASM execution -> q=1 reduction -> fidelity kernel -> SVM prediction
         q1_state = execute_qasm_to_q1(qasm_path, cache_root)
         kernel_row = fidelity_kernel_row(q1_state, train_states)
 
         confidence, margin, entropy = prediction_quality(classifier, kernel_row)
 
-        pred, exec_time, cpu_e, gpu_e, ram_e, total_e, emissions, ci = predict_with_energy(
+        pred, exec_time = predict_with_energy(
             classifier,
             kernel_row,
             dataset_name,
@@ -986,17 +1094,101 @@ def test_one_dataset(dataset_name: str, config: dict) -> pd.DataFrame:
             confidence=confidence,
             margin=margin,
             entropy=entropy,
-            cpu_energy=cpu_e,
-            gpu_energy=gpu_e,
-            ram_energy=ram_e,
-            total_energy=total_e,
-            emissions=emissions,
-            carbon_intensity=ci,
+            cpu_energy=0.0,
+            gpu_energy=0.0,
+            ram_energy=0.0,
+            total_energy=0.0,
+            emissions=0.0,
+            carbon_intensity=None,
             svm_path=svm_path,
             train_states_path=train_states_path,
         ))
 
+    full_inference_time = time.perf_counter() - full_inference_start
+
+    (
+        dataset_cpu_e,
+        dataset_gpu_e,
+        dataset_ram_e,
+        dataset_total_e,
+        dataset_emissions,
+        dataset_ci,
+        dataset_codecarbon_power_w,
+    ) = stop_dataset_energy_tracker(dataset_tracker)
+
     df = pd.DataFrame(rows)
+
+    # Allocate the measured dataset totals equally across sample rows.
+    # Summing the columns reproduces the exact dataset-level totals.
+    n_rows = len(df)
+
+    if n_rows > 0:
+        df["cpu_energy_kwh"] = dataset_cpu_e / n_rows
+        df["gpu_energy_kwh"] = dataset_gpu_e / n_rows
+        df["ram_energy_kwh"] = dataset_ram_e / n_rows
+        df["total_energy_kwh"] = dataset_total_e / n_rows
+        df["total_emissions_kg"] = dataset_emissions / n_rows
+        df["carbon_intensity_kgco2_kwh"] = dataset_ci
+
+        df["energy_per_token_kwh"] = np.where(
+            df["total_tokens"] > 0,
+            df["total_energy_kwh"] / df["total_tokens"],
+            0.0,
+        )
+
+        df["joules_per_token"] = df["energy_per_token_kwh"] * 3_600_000
+
+        # Recalculate watts AFTER CodeCarbon energy is available.
+        if dataset_total_e > 0 and full_inference_time > 0:
+
+            average_power_w = (
+                dataset_total_e * 3_600_000
+            ) / full_inference_time
+
+            watts_source = "dataset_energy_over_time"
+
+        elif dataset_codecarbon_power_w > 0:
+
+            average_power_w = dataset_codecarbon_power_w
+            watts_source = "codecarbon_power_fields"
+
+        else:
+
+            average_power_w = 0.0
+            watts_source = "unavailable"
+
+
+        df["watts_estimated"] = round(
+            float(average_power_w),
+            4
+        )
+
+        df["watts_estimated_source"] = watts_source
+
+        print(
+            f"watts_estimated = {average_power_w:.4f} W "
+            f"(source={watts_source})"
+        )
+
+        df["gpu_energy_pct_of_total"] = np.where(
+            df["total_energy_kwh"] > 0,
+            (df["gpu_energy_kwh"] / df["total_energy_kwh"]) * 100,
+            0.0,
+        )
+
+        df["cpu_energy_pct_of_total"] = np.where(
+            df["total_energy_kwh"] > 0,
+            (df["cpu_energy_kwh"] / df["total_energy_kwh"]) * 100,
+            0.0,
+        )
+
+    # Keep dataset-level totals explicitly for analysis.
+    df["dataset_total_cpu_energy_kwh"] = dataset_cpu_e
+    df["dataset_total_gpu_energy_kwh"] = dataset_gpu_e
+    df["dataset_total_ram_energy_kwh"] = dataset_ram_e
+    df["dataset_total_energy_kwh"] = dataset_total_e
+    df["dataset_total_emissions_kg"] = dataset_emissions
+    df["dataset_inference_time_sec"] = full_inference_time
 
     # Backfill model-level metrics into all rows for this dataset.
     y_true = df["true_label"].astype(int)
@@ -1036,6 +1228,7 @@ def main():
     if USE_ALL_TEST_SAMPLES:
         print("Mode: ALL discovered test samples per dataset")
         print("Dataset test counts are allowed to differ.")
+        print(f"Expected official test-set size per dataset: {EXPECTED_TEST_TOTAL:,}")
     else:
         print(
             f"Mode: balanced '10 set' -> {TEST_SAMPLES_PER_CLASS} samples/class "
@@ -1052,15 +1245,8 @@ def main():
         try:
             all_results.append(test_one_dataset(dataset_name, config))
         except Exception as exc:
-            error_trace = traceback.format_exc()
-            failures.append({
-                "dataset": dataset_name,
-                "error": repr(exc),
-                "traceback": error_trace,
-            })
+            failures.append({"dataset": dataset_name, "error": repr(exc)})
             print(f"\n[{dataset_name} FAILED] {type(exc).__name__}: {exc}")
-            print("\nFULL TRACEBACK:")
-            print(error_trace)
 
     if all_results:
         print('success')
@@ -1112,49 +1298,15 @@ def main():
 
 
 
-"""
-MNISQ Datasets: Combined Download & Extract
-================================================================================
 
-Downloads and extracts the TEST archives for all three MNISQ base-QASM datasets
-(MNIST, Fashion-MNIST, Kuzushiji-MNIST) in one run, each into its own directory,
-skipping anything already present. Function names are dataset-specific
-(ensure_mnist_dataset_available, ensure_fashionmnist_dataset_available,
-ensure_kuzushiji_dataset_available) so it's always clear which dataset a
-given call is fetching, even though they all share the same generic
-download/extract machinery underneath.
-
-Run this once before the three training scripts, or run it standalone
-just to pre-fetch/verify all three datasets.
-
-Install once:
-pip install requests tqdm
-"""
-
-
-
-import os
-import zipfile
-from pathlib import Path
-
-import requests
-from tqdm.auto import tqdm
 
 # =============================================================================
-# SHARED CONFIGURATION
+# DATASET-SPECIFIC ENTRY POINTS
 # =============================================================================
-
-FIDELITY = "f90"  # "f80", "f90", or "f95" -- must match what the training scripts expect
-
-PROJECT_ROOT = Path.cwd()
-
 OFFICIAL_BASE_URL = (
     "https://qulacs-quantum-datasets.s3.us-west-1.amazonaws.com"
 )
 
-# Per-dataset folders and archive names, matching each training script's
-# own DATA_ROOT / DOWNLOAD_ROOT / EXTRACT_ROOT layout exactly, so the
-# training scripts find the data without any path changes.
 MNIST_DATA_ROOT = PROJECT_ROOT / "mnisq_mnist_data"
 MNIST_DOWNLOAD_ROOT = MNIST_DATA_ROOT / "downloads"
 MNIST_EXTRACT_ROOT = MNIST_DATA_ROOT / "extracted"
@@ -1181,22 +1333,6 @@ for folder in [
     folder.mkdir(parents=True, exist_ok=True)
 
 
-# =============================================================================
-# GENERIC DOWNLOAD / EXTRACT HELPERS (shared by all three datasets)
-# =============================================================================
-
-def human_size(number_of_bytes: int | float) -> str:
-    value = float(number_of_bytes)
-    units = ["B", "KB", "MB", "GB", "TB"]
-
-    for unit in units:
-        if value < 1024 or unit == units[-1]:
-            return f"{value:.2f} {unit}"
-        value /= 1024
-
-    return f"{value:.2f} TB"
-
-
 def remote_file_size(url: str, timeout: int = 60) -> int | None:
     """Return remote file size when the server provides Content-Length."""
     try:
@@ -1210,8 +1346,24 @@ def remote_file_size(url: str, timeout: int = 60) -> int | None:
         return int(size) if size is not None else None
     except requests.RequestException:
         return None
+def human_size(number_of_bytes: int | float) -> str:
+    value = float(number_of_bytes)
+    units = ["B", "KB", "MB", "GB", "TB"]
 
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{value:.2f} {unit}"
+        value /= 1024
 
+    return f"{value:.2f} TB"
+
+def archive_marker(extract_root: Path, archive_name: str) -> Path:
+    """
+    A small marker file dropped after successful extraction. Its presence
+    means "already extracted" so re-running this script is a fast no-op
+    instead of re-unzipping thousands of files every time.
+    """
+    return extract_root / f".{archive_name}.extracted"
 def download_file(
     url: str,
     destination: Path,
@@ -1331,16 +1483,6 @@ def safe_extract_zip(zip_path: Path, extraction_directory: Path) -> None:
         ):
             archive.extract(member, extraction_directory)
 
-
-def archive_marker(extract_root: Path, archive_name: str) -> Path:
-    """
-    A small marker file dropped after successful extraction. Its presence
-    means "already extracted" so re-running this script is a fast no-op
-    instead of re-unzipping thousands of files every time.
-    """
-    return extract_root / f".{archive_name}.extracted"
-
-
 def ensure_archive_downloaded_and_extracted(
     archive_name: str,
     url: str,
@@ -1373,10 +1515,6 @@ def ensure_archive_downloaded_and_extracted(
 
     print(f"Extraction complete: {archive_path.name}")
 
-
-# =============================================================================
-# DATASET-SPECIFIC ENTRY POINTS
-# =============================================================================
 
 def ensure_mnist_dataset_available() -> None:
     print("=" * 78)
@@ -1446,11 +1584,6 @@ def ensure_all_mnisq_datasets_available() -> None:
     print(f"  Fashion-MNIST   -> {FASHIONMNIST_EXTRACT_ROOT.resolve()}")
     print(f"  Kuzushiji-MNIST -> {KUZUSHIJI_EXTRACT_ROOT.resolve()}")
     print("=" * 78)
-
-
-# =============================================================================
-# MAIN
-# =============================================================================
 
 if __name__ == "__main__":
     ensure_all_mnisq_datasets_available()
