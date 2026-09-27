@@ -86,7 +86,7 @@ else:
     DEVICE = torch.device("cpu")
 
 
-DATA_ROOT = Path("./classical_data")
+DATA_ROOT = Path("../classical_data")
 
 OUTPUT_ROOT = Path.cwd() / "test_results"
 OUTPUT_ROOT.mkdir(
@@ -108,10 +108,7 @@ DATASET_CONFIGS = {
             "mnist",
 
         "yolo_checkpoint":
-            Path("yolo26n_mnist_cpu.pt"),
-
-        "mobilenet_checkpoint":
-            Path("mobilenet_v2_mnist_cpu.pt"),
+            Path("../yolo26n_mnist_cpu.pt"),
     },
 
     "FashionMNIST": {
@@ -122,10 +119,8 @@ DATASET_CONFIGS = {
             "fashionmnist",
 
         "yolo_checkpoint":
-            Path("yolo26n_fashionmnist_cpu.pt"),
+            Path("../yolo26n_fashionmnist_cpu.pt"),
 
-        "mobilenet_checkpoint":
-            Path("mobilenet_v2_fashionmnist_cpu.pt"),
     },
 
     "KMNIST": {
@@ -136,10 +131,7 @@ DATASET_CONFIGS = {
             "kmnist",
 
         "yolo_checkpoint":
-            Path("yolo26n_kmnist_cpu.pt"),
-
-        "mobilenet_checkpoint":
-            Path("mobilenet_v2_kmnist_cpu.pt"),
+            Path("../yolo26n_kmnist_cpu.pt"),
     },
 }
 

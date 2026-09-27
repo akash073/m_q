@@ -1005,14 +1005,14 @@ def collect_for_model(base_dataset, model_name, dataset_name="MNIST", mean=(0.13
     checkpoint_prefix = DATASET_CONFIGS[dataset_name]["checkpoint_prefix"]
 
     if model_name == "CNN":
-        checkpoint_path = f"{checkpoint_prefix}_cnn.pth"
+        checkpoint_path = f"../{checkpoint_prefix}_cnn.pth"
         model = SimpleCNN().to(DEVICE)
         model.load_state_dict(torch.load(checkpoint_path, map_location=DEVICE))
         model.eval()
         model_flops = compute_model_flops(model, DEVICE)
 
     elif model_name == "DNN":
-        checkpoint_path = f"{checkpoint_prefix}_dnn.pth"
+        checkpoint_path = f"../{checkpoint_prefix}_dnn.pth"
         model = SimpleDNN().to(DEVICE)
         model.load_state_dict(torch.load(checkpoint_path, map_location=DEVICE))
         model.eval()
@@ -1125,7 +1125,7 @@ def main():
         # Raw ToTensor only here — normalization is applied per-sample
         # inside _run_torch_model using this dataset's own mean/std.
         base_dataset = config["dataset_class"](
-            root="./classical_data",
+            root="../classical_data",
             train=False,
             download=True,
             transform=transforms.ToTensor()

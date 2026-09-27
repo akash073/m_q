@@ -1,5 +1,5 @@
 # ============================================================
-# 10-QUBIT HYBRID YOLO CLASSIFIER
+# 1-QUBIT HYBRID YOLO CLASSIFIER
 # MNIST / FashionMNIST / KMNIST
 #
 # Behavior:
@@ -57,7 +57,7 @@ from ultralytics import YOLO
 # CONFIGURATION
 # ============================================================
 
-BASE_DIR = Path("./classical_data")
+BASE_DIR = Path("../classical_data")
 CHECKPOINT_DIR = Path("./quantum_checkpoints")
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -66,7 +66,9 @@ random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 
-EPOCHS = 10
+EPOCHS = int(
+    os.getenv("TRAIN_EPOCHS", "1")
+)
 IMG_SIZE = 64
 
 N_QUBITS = 1
@@ -107,11 +109,7 @@ DEVICE_MODE = os.getenv(
     "cpu",
 ).lower()
 
-if DEVICE_MODE == "cuda" and torch.cuda.is_available():
-    DEVICE = torch.device("cuda")
-else:
-    # PennyLane default.qubit is CPU-based, so CPU is the safest default.
-    DEVICE = torch.device("cpu")
+DEVICE = torch.device("cpu")
 
 
 DATASET_CONFIGS = {
@@ -144,7 +142,7 @@ IMAGE_TRANSFORM = transforms.Compose([
 
 
 # ============================================================
-# 10-QUBIT QUANTUM CLASSIFICATION HEAD
+# 1-QUBIT QUANTUM CLASSIFICATION HEAD
 # ============================================================
 
 def build_quantum_circuit(
@@ -153,7 +151,7 @@ def build_quantum_circuit(
     device_name: str = PENNYLANE_DEVICE,
 ):
     """
-    10-qubit variational quantum circuit.
+    Variational quantum circuit.
 
     Input:
         x       -> n_qubits encoded angles
@@ -162,7 +160,7 @@ def build_quantum_circuit(
     Output:
         one Pauli-Z expectation value per qubit
 
-    Since N_QUBITS = 10 and MNIST-family datasets have 10 classes,
+    Since N_QUBITS = 1 and MNIST-family datasets have 10 classes,
     the ten expectation values are used as ten class features.
     """
 
@@ -215,7 +213,7 @@ def build_quantum_circuit(
                         ]
                     )
 
-        # 10 expectation values
+        # 1 expectation value
         return [
             qml.expval(
                 qml.PauliZ(q)
@@ -235,18 +233,18 @@ class QuantumYOLOHead(nn.Module):
         YOLO feature vector
               |
               v
-        Linear(in_features -> 10)
+        Linear(in_features -> 1)
               |
             tanh*pi
               |
               v
-         10-qubit VQC
+         1-qubit VQC
               |
               v
-        10 expectation values
+        1 expectation value
               |
               v
-        trainable scale + bias
+        Linear(1 -> 10)
               |
               v
         10 class logits
@@ -280,23 +278,19 @@ class QuantumYOLOHead(nn.Module):
             )
         )
 
-        # Trainable affine transformation after quantum measurement.
-        self.output_scale = nn.Parameter(
-            torch.ones(
-                self.n_qubits
-            )
-        )
-
-        self.output_bias = nn.Parameter(
-            torch.zeros(
-                self.n_qubits
-            )
-        )
-
         self.qnode = build_quantum_circuit(
             n_qubits=self.n_qubits,
             n_layers=self.n_layers,
             device_name=PENNYLANE_DEVICE,
+        )
+
+        # IMPORTANT: the circuit returns n_qubits quantum features,
+        # but MNIST/FashionMNIST/KMNIST always have 10 classes.
+        # This layer maps 1 quantum feature -> 10 class logits when
+        # N_QUBITS = 1.
+        self.classifier = nn.Linear(
+            self.n_qubits,
+            N_CLASSES,
         )
 
     def _forward_single(
@@ -304,7 +298,7 @@ class QuantumYOLOHead(nn.Module):
         features: torch.Tensor,
     ) -> torch.Tensor:
 
-        # Compress features to exactly 10 values.
+        # Compress YOLO features to exactly 1 quantum input angle.
         angles = self.feature_to_qubits(
             features
         )
@@ -332,10 +326,8 @@ class QuantumYOLOHead(nn.Module):
             dtype=torch.float32
         )
 
-        logits = (
+        logits = self.classifier(
             q_features
-            * self.output_scale
-            + self.output_bias
         )
 
         return logits
@@ -478,7 +470,7 @@ def build_quantum_yolo():
     )
 
     print(
-        f"  -> 10-qubit quantum head"
+        f"  -> 1-qubit quantum head"
     )
 
     quantum_head = QuantumYOLOHead(
@@ -530,7 +522,7 @@ def save_checkpoint(
         ),
 
         "model_name":
-            "YOLO26n-CLS-10Qubit",
+            "YOLO26n-CLS-1Qubit",
 
         "n_qubits": int(
             N_QUBITS
@@ -1118,7 +1110,7 @@ def get_or_train_model(
         and not FORCE_RETRAIN
     ):
         print(
-            "\nSaved 10-qubit YOLO model found."
+            "\nSaved 1-qubit YOLO model found."
         )
 
         model = load_checkpoint(
@@ -1131,7 +1123,7 @@ def get_or_train_model(
         )
 
     print(
-        "\nNo saved 10-qubit YOLO model found."
+        "\nNo saved 1-qubit YOLO model found."
     )
 
     print(
@@ -1397,7 +1389,7 @@ def main():
             torch.cuda.empty_cache()
 
     print(
-        "\nAll YOLO 10-qubit "
+        "\nAll YOLO 1-qubit "
         "models complete."
     )
 

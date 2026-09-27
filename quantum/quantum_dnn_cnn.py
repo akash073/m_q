@@ -137,7 +137,7 @@ def resolve_device():
 # PennyLane default.qubit is CPU-based. Keep PyTorch on CPU by default.
 DEVICE = resolve_device()
 
-DATA_ROOT = Path("./classical_data")
+DATA_ROOT = Path("../classical_data")
 OUTPUT_ROOT = Path.cwd() / "test_results"
 CHECKPOINT_DIR = Path.cwd() / "quantum_checkpoints"
 
