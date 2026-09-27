@@ -19,3 +19,7 @@ runs/**/*
 yolo_classification_data/**/*
 raw_data/**/*
 __pycache__
+
+quantum/test_results/9f56743a/*
+quantum/__pycache__
+
