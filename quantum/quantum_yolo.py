@@ -67,7 +67,7 @@ np.random.seed(SEED)
 torch.manual_seed(SEED)
 
 EPOCHS = int(
-    os.getenv("TRAIN_EPOCHS", "1")
+    os.getenv("TRAIN_EPOCHS", "10")
 )
 IMG_SIZE = 64
 

@@ -63,7 +63,7 @@ np.random.seed(SEED)
 torch.manual_seed(SEED)
 
 NUM_TEST_SAMPLES = int(
-    os.getenv("NUM_TEST_SAMPLES", "1")
+    os.getenv("NUM_TEST_SAMPLES", "10000")
 )
 
 TRAIN_SAMPLES = int(
@@ -71,7 +71,7 @@ TRAIN_SAMPLES = int(
 )
 
 TRAIN_EPOCHS = int(
-    os.getenv("TRAIN_EPOCHS", "1")
+    os.getenv("TRAIN_EPOCHS", "10")
 )
 
 TRAIN_BATCH_SIZE = int(
