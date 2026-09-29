@@ -15,8 +15,8 @@ import classical_yolo
 import quantum_yolo
 
 
-# classical_cnn_dnn.main()
-# classical_yolo.main()
+classical_cnn_dnn.main()
+classical_yolo.main()
 
 quantum_dnn_cnn.main()
 quantum_yolo.main()
