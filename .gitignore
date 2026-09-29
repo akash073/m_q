@@ -23,3 +23,6 @@ __pycache__
 quantum/test_results/9f56743a/*
 quantum/__pycache__
 
+quantum/test_results
+quantum/test_results/codecarbon
+
