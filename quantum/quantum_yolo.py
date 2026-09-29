@@ -92,7 +92,7 @@ TRAIN_SAMPLES = int(
 )
 
 TEST_SAMPLES = int(
-    os.getenv("NUM_TEST_SAMPLES", "1")
+    os.getenv("NUM_TEST_SAMPLES", "10000")
 )
 
 FORCE_RETRAIN = (
