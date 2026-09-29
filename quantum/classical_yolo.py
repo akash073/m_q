@@ -57,7 +57,7 @@ from ultralytics import YOLO
 # ============================================================
 
 NUM_TEST_SAMPLES = int(
-    os.getenv("NUM_TEST_SAMPLES", "1")
+    os.getenv("NUM_TEST_SAMPLES", "10000")
 )
 
 DEVICE_MODE = os.getenv(
